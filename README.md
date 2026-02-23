@@ -46,21 +46,39 @@
 
 ### Platform Coverage
 
-| Platform | Agent | Packages | Patches | Inventory |
-|----------|-------|----------|---------|-----------|
-| **Windows** | Planned | .exe, .msi, .ps1, .zip | .msu (KB) | Full |
-| **Ubuntu Linux** | Done | .deb (APT repo) | .deb (auto-discovery) | Full |
-| **macOS** | Not started | — | — | — |
+| Platform | Agent | Packages | Patches | Inventory | Peripherals |
+|----------|-------|----------|---------|-----------|-------------|
+| **Windows** | Done | .exe, .msi, .ps1, .zip | .msu (KB) | Full (CPU, GPU, TPM, BIOS, motherboard) | Full (USB, monitors, printers, cameras, Bluetooth, audio) |
+| **Ubuntu Linux** | Done | .deb (APT repo) | .deb (auto-discovery) | Full (CPU, RAM, disk, BIOS) | Partial |
+| **macOS** | Not started | — | — | — | — |
 
-### Known Agent Gaps (Ubuntu)
+### Windows Agent Highlights (Already Complete)
 
-| Gap | Impact |
-|-----|--------|
-| Agent self-update not implemented | Can't patch the agent itself remotely |
-| GPU detection missing | Incomplete hardware inventory for GPU workstations |
-| Peripheral discovery empty on Linux | No monitor/printer/USB detection |
-| TLS verification disabled by default | Security risk in production |
-| Hardware grade hardcoded to "B" | No real scoring |
+The Windows agent (`agent/`) is a full-featured endpoint client:
+
+| Capability | Details |
+|------------|---------|
+| **Windows Service** | Runs as `InfraKnitAgent` system service via PyWin32 |
+| **System Tray UI** | Tray icon + self-service install window (Tkinter + pystray) |
+| **Hardware Collection** | CPU, GPU (NVIDIA/AMD/Intel + VRAM), TPM, BIOS, motherboard, power supply |
+| **Peripheral Discovery** | USB HID (keyboards, mice), monitors (WMI), printers, cameras, Bluetooth, audio devices |
+| **Software Inventory** | Registry-based (HKLM + HKCU, 32-bit + 64-bit), MSI product GUIDs |
+| **OS Info** | Version, build, edition, domain/workgroup, hotfixes, Windows Update status |
+| **Security Status** | Windows Defender, Firewall, Secure Boot, TPM status |
+| **Installers** | EXE (silent args), MSI (msiexec), PowerShell scripts |
+| **Agent Self-Update** | Downloads new version, replaces binary, restarts service |
+| **Rollback / Backup** | Pre-install state capture, failure recovery |
+| **Token Security** | Windows Credential Manager (keyring) with file fallback |
+
+### Known Agent Gaps (Ubuntu Only)
+
+| Gap | Impact | Windows Status |
+|-----|--------|---------------|
+| Agent self-update not implemented | Can't patch the agent itself remotely | Done on Windows |
+| GPU detection missing | Incomplete hardware inventory for GPU workstations | Done on Windows |
+| Peripheral discovery empty on Linux | No monitor/printer/USB detection | Done on Windows |
+| TLS verification disabled by default | Security risk in production | Same issue |
+| Hardware grade hardcoded to "B" | No real scoring | Same issue |
 
 ---
 
@@ -468,20 +486,132 @@ Output:
 
 ---
 
-### 4.3 Natural Language Query (Medium Impact)
-**What:** Ask questions in English instead of building filters.
+### 4.3 Natural Language Query — Offline LLM (High Impact)
+**What:** Ask questions in English instead of building filters. Runs 100% offline on the server.
 
 ```
 Admin types: "Show me all servers in Mumbai running OpenSSL older than 3.0"
-System translates to: SELECT agents WHERE location LIKE 'Mumbai%' AND software
-                       LIKE 'openssl' AND version < '3.0' AND asset_type = 'server'
+System translates to: SELECT a.hostname, si.name, si.version FROM agents a
+                       JOIN assets ast ON ... JOIN software_inventory si ON ...
+                       JOIN locations l ON ... WHERE l.city LIKE 'Mumbai%'
+                       AND si.name LIKE '%openssl%' AND ast.asset_type = 'server'
+
 Admin types: "Which agents haven't been patched in 30 days?"
-System translates to: Agents WHERE last_patch_job > 30 days ago
+System translates to: SELECT a.hostname FROM agents a WHERE a.id NOT IN
+                       (SELECT agent_id FROM jobs WHERE job_type='patch'
+                       AND completed_at > NOW() - INTERVAL 30 DAY)
+
+Admin types: "How many security updates are pending for noble?"
+System translates to: SELECT COUNT(*) FROM update_catalog
+                       WHERE codename='noble' AND is_security_update=1
+                       AND download_status='pending'
 ```
 
-**Implementation:** Use Claude API (or local LLM) to convert natural language → SQL/API filters. The LLM gets the database schema as context and generates safe, read-only queries.
+**Why offline?** Our servers are air-gapped. No cloud API calls. The model runs locally on the same Windows server.
 
-**Value:** Non-technical managers can get answers without learning the UI.
+**Recommended Model: SQLCoder by Defog (from Hugging Face)**
+
+| Option | Model | Size | RAM Needed | Quality |
+|--------|-------|------|-----------|---------|
+| **Best** | `defog/sqlcoder-8b` | 4.5 GB (Q4 quantized) | 8 GB | Excellent — purpose-built for text-to-SQL |
+| Good | `defog/sqlcoder-7b-2` | 4 GB (Q4 quantized) | 6 GB | Very good, older version |
+| Lightweight | `microsoft/Phi-3-mini-4k` | 2.3 GB (Q4 quantized) | 4 GB | Good with fine-tuning |
+| Minimal | `TinyLlama/TinyLlama-1.1B` | 0.7 GB (Q4 quantized) | 2 GB | Needs heavy fine-tuning |
+
+**Why SQLCoder?**
+- Specifically trained on text-to-SQL tasks (not general chat)
+- Outperforms GPT-4 on SQL generation benchmarks (Defog's own eval)
+- Open source (Apache 2.0 license), free to use commercially
+- Works great with schema prompts — exactly our use case
+
+**Implementation Architecture:**
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  InfraKnit Server                     │
+│                                                      │
+│  ┌──────────┐    ┌──────────────┐    ┌────────────┐ │
+│  │ Frontend  │───→│ /api/v1/     │───→│ MySQL      │ │
+│  │ NLQ Input │    │ nlq/query    │    │ (read-only │ │
+│  └──────────┘    └──────┬───────┘    │  execute)  │ │
+│                         │            └────────────┘ │
+│                  ┌──────┴───────┐                    │
+│                  │  NLQ Service  │                    │
+│                  │              │                    │
+│                  │ 1. Load schema│                    │
+│                  │    prompt     │                    │
+│                  │ 2. Send to    │                    │
+│                  │    local LLM  │                    │
+│                  │ 3. Get SQL    │                    │
+│                  │ 4. Validate   │                    │
+│                  │    (read-only)│                    │
+│                  │ 5. Execute    │                    │
+│                  │ 6. Return     │                    │
+│                  │    results    │                    │
+│                  └──────┬───────┘                    │
+│                         │                            │
+│                  ┌──────┴───────┐                    │
+│                  │ llama.cpp    │                    │
+│                  │ (llama-cpp-  │                    │
+│                  │  python)     │                    │
+│                  │              │                    │
+│                  │ SQLCoder 8B  │                    │
+│                  │ GGUF model   │                    │
+│                  │ (4.5 GB file)│                    │
+│                  └──────────────┘                    │
+└──────────────────────────────────────────────────────┘
+```
+
+**Step-by-step setup:**
+
+1. **Download model (one-time, on a machine with internet):**
+   ```
+   # Download GGUF quantized model from Hugging Face
+   # Copy to server via USB drive (air-gapped)
+   # Place at: Master-Backend/models/ai/sqlcoder-8b-q4.gguf
+   ```
+
+2. **Install runtime (pip, on server):**
+   ```
+   pip install llama-cpp-python
+   ```
+   No GPU needed — runs on CPU. Q4 quantization keeps it fast (2-5 seconds per query).
+
+3. **Schema prompt (auto-generated from SQLAlchemy models):**
+   ```
+   ### Database Schema:
+   TABLE agents (id INT PK, hostname VARCHAR, ip_address VARCHAR, status ENUM(online,offline), ...)
+   TABLE assets (id INT PK, agent_id FK→agents, asset_type VARCHAR, department VARCHAR, ...)
+   TABLE software_inventory (id INT PK, asset_id FK→assets, name VARCHAR, version VARCHAR, ...)
+   TABLE update_catalog (id INT PK, package_name VARCHAR, codename VARCHAR, is_security_update BOOL, ...)
+   TABLE jobs (id INT PK, agent_id FK→agents, job_type VARCHAR, status VARCHAR, completed_at DATETIME, ...)
+   TABLE locations (id INT PK, name VARCHAR, city VARCHAR, parent_id FK→locations, ...)
+   ... (35 tables total)
+
+   ### Question: {user_question}
+   ### SQL:
+   ```
+
+4. **Safety guardrails:**
+   - Only `SELECT` statements allowed (regex check before execution)
+   - Execute with read-only database user or `SET SESSION TRANSACTION READ ONLY`
+   - Max 1000 rows returned
+   - Query timeout: 10 seconds
+   - Log all generated queries for audit
+
+5. **Fine-tuning (optional, improves accuracy):**
+   - Create 200-500 example pairs: `{question → correct_sql}` using our schema
+   - Fine-tune with LoRA adapter (takes 1-2 hours on CPU, or 15 min on GPU)
+   - Examples: "agents with critical vulnerabilities" → exact SQL for our schema
+   - Store adapter alongside base model (~50 MB)
+
+**Server impact:**
+- RAM: +8 GB (model loaded in memory)
+- Disk: +5 GB (model file)
+- CPU: 2-5 seconds per query (acceptable for interactive use)
+- Scales fine — only runs when admin asks a question, not per-agent
+
+**Value:** Non-technical managers query the system in plain English. Works 100% offline. No API costs. No data leaves the server.
 
 ---
 
@@ -524,7 +654,7 @@ AI analysis:
 - Suggestion: "Download and deploy libfoo 2.0 first, then retry this package"
 ```
 
-**Implementation:** Feed error logs + context to Claude API. Return actionable suggestion.
+**Implementation:** Feed error logs + context to the same local SQLCoder/Phi-3 model (or a separate small model like `TinyLlama`). The model gets the error message + job context as input and returns a suggestion. For common errors, a rule-based engine handles it without the LLM (faster, more reliable). LLM is the fallback for unusual errors.
 
 ---
 
@@ -562,17 +692,25 @@ Output: Coverage report — "InfraKnit covers 67/100 CIS rules.
 
 ### AI Implementation Summary
 
-| Feature | Complexity | AI Type | API Cost | Offline Capable |
-|---------|-----------|---------|----------|-----------------|
+| Feature | Complexity | AI Type | Cost | Offline Capable |
+|---------|-----------|---------|------|-----------------|
 | Anomaly Detection | Medium | Statistical (no LLM) | Free | Yes |
 | Smart Patch Priority | Medium | Scoring algorithm + CVE data | Free | Yes |
-| Natural Language Query | Medium | LLM (Claude API) | ~$0.01/query | No (needs API) |
+| Natural Language Query | Medium | Local LLM (SQLCoder 8B GGUF) | Free (one-time 5 GB download) | **Yes** |
 | Predictive Maintenance | Low | Statistical (trend analysis) | Free | Yes |
-| Auto-Remediation | Low | LLM (Claude API) | ~$0.02/suggestion | No (needs API) |
-| Asset Classification | Low | Rule-based + optional LLM | Free / ~$0.005 | Yes (rule-based) |
-| Compliance Gap Analysis | High | LLM + custom rules | ~$0.05/analysis | No (needs API) |
+| Auto-Remediation | Low | Rule-based + local LLM fallback | Free | **Yes** |
+| Asset Classification | Low | Rule-based + optional local LLM | Free | Yes |
+| Compliance Gap Analysis | High | Local LLM + custom rules | Free | **Yes** |
 
-**Note:** Anomaly detection, patch prioritization, and predictive maintenance are pure algorithms — no LLM API needed. They run entirely on-server and work offline.
+**All 7 AI features run 100% offline.** No cloud API calls. No data leaves the server.
+
+The local LLM (SQLCoder 8B or Phi-3) adds ~8 GB RAM and ~5 GB disk to server requirements. It handles NLQ, auto-remediation, and compliance analysis. The other 4 features are pure algorithms with zero LLM dependency.
+
+**Model download strategy for air-gapped environments:**
+1. Download GGUF model on any internet-connected machine
+2. Copy to USB drive (~5 GB)
+3. Place in `Master-Backend/models/ai/` on the server
+4. Model auto-loads on first NLQ request
 
 ---
 
@@ -581,7 +719,7 @@ Output: Coverage report — "InfraKnit covers 67/100 CIS rules.
 ### Deployment Scenario
 
 ```
-- 1,000 Ubuntu agents (mix of jammy + noble)
+- 1,000 agents (mix of Windows + Ubuntu jammy/noble)
 - 100% offline (air-gapped LAN)
 - All agents report to single server
 - Heartbeat: every 60 seconds
@@ -618,17 +756,18 @@ Output: Coverage report — "InfraKnit covers 67/100 CIS rules.
 | **Network** | 1 Gbps Ethernet | Sufficient for 1000 agents on LAN |
 | **OS** | Windows Server 2022 Standard | Current deployment target |
 
-#### Recommended (1,000 agents, all V2 features, growth headroom)
+#### Recommended (1,000 agents, all V2 features including AI, growth headroom)
 
 | Component | Specification | Rationale |
 |-----------|--------------|-----------|
-| **CPU** | 8 cores / 16 threads (Intel Xeon E-2400 or AMD EPYC 4004) | CVE scanning, compliance checks, background sync all CPU-bound |
-| **RAM** | 32 GB DDR5 | MySQL buffer pool (8 GB) + Python workers (16 GB) + cache (4 GB) + OS (4 GB) |
+| **CPU** | 8 cores / 16 threads (Intel Xeon E-2400 or AMD EPYC 4004) | CVE scanning, compliance checks, background sync + LLM inference all CPU-bound |
+| **RAM** | **48 GB DDR5** | MySQL buffer pool (8 GB) + Python workers (16 GB) + **local LLM (8 GB)** + cache (4 GB) + OS (4 GB) + headroom (8 GB) |
 | **System Disk** | 256 GB NVMe SSD | OS + application |
-| **Data Disk** | 1 TB NVMe SSD | Database + APT catalog + patch storage + backups |
+| **Data Disk** | 1 TB NVMe SSD | Database + APT catalog + patch storage + **AI model (5 GB)** + backups |
 | **Network** | 1 Gbps Ethernet (2x for redundancy) | Sufficient for 2,000+ agents |
 | **OS** | Windows Server 2022 Standard | Current deployment target |
 | **UPS** | 1000 VA | Prevent database corruption on power loss |
+| **GPU (optional)** | NVIDIA T400/A2000 (4 GB VRAM) | Speeds up LLM inference from 5s → 0.5s per query. Not required — CPU works fine for interactive use |
 
 #### Future-Proof (2,500+ agents, multi-site with relays)
 
@@ -763,10 +902,10 @@ InfraKnit has built-in retention policies. Old data is purged automatically.
 
 ```
 ┌──────────┐     HTTP     ┌────────────────────┐
-│  Agent   │ ───────────→ │  FastAPI (uvicorn)  │
-│  ×1000   │ ←─────────── │  Single process     │
-└──────────┘              │  SQLite/MySQL       │
-                          │  File storage       │
+│  Agent   │ ───────────→ │  FastAPI (uvicorn) │
+│  ×1000   │ ←─────────── │  Single process    │
+└──────────┘              │  SQLite/MySQL      │
+                          │  File storage      │
                           └────────────────────┘
 ```
 
@@ -777,8 +916,8 @@ InfraKnit has built-in retention policies. Old data is purged automatically.
 │  Agent   │  HTTPS  │         InfraKnit Server          │
 │  ×1000   │ ──────→ │                                   │
 └──────────┘         │  ┌─────────┐    ┌──────────────┐  │
-                     │  │ Nginx   │───→│ FastAPI       │  │
-                     │  │ (TLS +  │    │ (4 workers)   │  │
+                     │  │ Nginx   │───→│ FastAPI      │  │
+                     │  │ (TLS +  │    │ (4 workers)  │  │
                      │  │  static)│    └──────┬───────┘  │
                      │  └─────────┘           │          │
                      │                   ┌────┴────┐     │
@@ -884,11 +1023,13 @@ Month 10-12: Multi-tenant + Custom Dashboards + Advanced Reports + NLP Query
 
 ## Summary
 
-InfraKnit V1 is a **solid, feature-complete** endpoint management platform with 150+ API endpoints, 24 frontend pages, and full Linux agent coverage. The unique strength — **fully offline operation with auto-patching** — is unmatched by Fleet or ManageEngine.
+InfraKnit V1 is a **solid, feature-complete** endpoint management platform with 150+ API endpoints, 24 frontend pages, and **both Windows and Ubuntu agents fully built**. The unique strength — **fully offline operation with auto-patching** — is unmatched by Fleet or ManageEngine.
 
-V2 closes the gap on **security visibility** (CVE scanning, compliance), **operational control** (remote terminal, app control, USB control), and **intelligence** (AI-powered anomaly detection and patch prioritization) — while maintaining the offline-first architecture that makes InfraKnit unique.
+V2 closes the gap on **security visibility** (CVE scanning, compliance), **operational control** (remote terminal, app control, USB control), and **intelligence** (AI-powered anomaly detection, patch prioritization, and natural language queries via offline LLM) — while maintaining the offline-first architecture that makes InfraKnit unique.
 
-For 1,000 agents: an 8-core, 32 GB RAM server with 1 TB SSD handles everything comfortably. Annual data storage with retention policies is ~280 GB. Network bandwidth is negligible (< 1 Mbps sustained).
+**Every AI feature runs 100% offline** using a local LLM (SQLCoder 8B from Hugging Face, 5 GB file). No cloud APIs. No data leaves the server.
+
+For 1,000 agents: an 8-core, 48 GB RAM server with 1 TB NVMe SSD handles everything including the local AI model. Annual data storage with retention policies is ~280 GB. Network bandwidth is negligible (< 1 Mbps sustained).
 
 ---
 
