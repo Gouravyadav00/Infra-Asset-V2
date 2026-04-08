@@ -49,7 +49,7 @@
 | Platform | Agent | Packages | Patches | Inventory | Peripherals |
 |----------|-------|----------|---------|-----------|-------------|
 | **Windows** | Done | .exe, .msi, .ps1, .zip | .msu (KB) | Full (CPU, GPU, TPM, BIOS, motherboard) | Full (USB, monitors, printers, cameras, Bluetooth, audio) |
-| **Ubuntu Linux** | Done | .deb (APT repo) | .deb (auto-discovery) | Full (CPU, RAM, disk, BIOS) | Partial |
+| **Ubuntu Linux** | Done | .deb (APT repo) | .deb (auto-discovery) | Full (CPU, RAM, disk, BIOS) | Fully |
 | **macOS** | Not started | — | — | — | — |
 
 ### Windows Agent Highlights (Already Complete)
