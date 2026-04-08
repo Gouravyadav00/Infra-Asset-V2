@@ -99,7 +99,7 @@ The Windows agent (`agent/`) is a full-featured endpoint client:
 | Package deployment (Linux .deb) | Yes | No | Yes |
 | Patch management (Windows KB) | Yes | No | Yes |
 | Patch management (Linux auto-discovery) | Yes | No | Yes |
-| **Third-party patch management** | **No** | No | **Yes** |
+| Third-party patch management | Yes | No | Yes |
 | Service packs (bundles) | Yes | No | Yes |
 | Job scheduling (cron) | Yes | Partial | Yes |
 | Deployment tracking | Yes | No | Yes |
@@ -129,7 +129,7 @@ The Windows agent (`agent/`) is a full-featured endpoint client:
 | **Webhook / SIEM integration** | **No** | **Yes** | **Yes** |
 | **AI-powered analytics** | **No** | No | **Partial** |
 | **Multi-tenant support** | **No** | **Yes** | **Yes** |
-| **Agent self-update** | **No** | **Yes** | **Yes** |
+| **Agent self-update** | **Partial** | **Yes** | **Yes** |
 | **Offline / air-gapped operation** | **Yes** | No | Partial |
 
 ### Our Unique Strengths
